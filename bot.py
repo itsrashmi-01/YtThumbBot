@@ -2,211 +2,225 @@ import os
 import re
 import logging
 from datetime import datetime
-from pyrogram import Client, filters, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pymongo import MongoClient
-from pyrogram.errors import UserNotParticipant
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 
-# Load .env
+# Load environment variables from .env file
 load_dotenv()
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# --- Configuration ---
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MONGO_URI = os.environ.get("MONGO_URI")
+FORCE_CHANNEL = os.environ.get("FORCE_CHANNEL")
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL"))
+ADMINS = [int(admin) for admin in os.environ.get("ADMINS", "").split(",")]
+BOT_NAME = os.environ.get("BOT_NAME", "YT Thumbnail Downloader")
+START_IMAGE = os.environ.get("START_IMAGE", "https://telegra.ph/file/1b2df9f3014633f679544.jpg")
 
-# Environment variables (loaded from .env or Koyeb env)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH")
-MONGO_URI = os.getenv("MONGO_URI")
-FORCE_CHANNEL = os.getenv("FORCE_CHANNEL")  # e.g., @channelusername or channel ID
-LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "0"))
-ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(',') if x.strip()]
-START_IMAGE = os.getenv("START_IMAGE", "https://telegra.ph/file/9b1f6c9c5ff0f6a507d9e.jpg")
-BOT_NAME = os.getenv("BOT_NAME", "YouTube Thumbnail Downloader Bot")
+# --- Initialize Logging ---
+logging.basicConfig(level=logging.INFO)
 
-if not BOT_TOKEN or API_ID == 0 or not API_HASH or not MONGO_URI:
-    logger.error("Missing essential environment variables. Please check .env or Koyeb configuration.")
-    raise SystemExit(1)
+# --- Initialize MongoDB ---
+try:
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client.get_database("youtube_thumbnail_bot")
+    user_collection = db.get_collection("users")
+    logging.info("Successfully connected to MongoDB.")
+except Exception as e:
+    logging.error(f"Error connecting to MongoDB: {e}")
+    mongo_client = None
 
-# MongoDB setup
-mongo = MongoClient(MONGO_URI)
-db = mongo.get_database("ytthumbbot")
-users_col = db["users"]
-logs_col = db["logs"]
+# --- Initialize Pyrogram Client ---
+app = Client("thumbnail_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Pyrogram client
-app = Client("yt_thumb_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+# --- Helper Functions ---
 
-# Utilities
-def now_str():
-    return datetime.utcnow().strftime("%d %b %Y, %I:%M %p (UTC)")
+def get_video_id(url):
+    """Extracts YouTube video ID from various URL formats."""
+    regex = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})"
+    match = re.search(regex, url)
+    return match.group(1) if match else None
 
-YOUTUBE_REGEX = re.compile(r"(?:https?://)?(?:www\.)?(?:m\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})")
-
-def extract_video_id(text: str):
-    m = YOUTUBE_REGEX.search(text)
-    if m:
-        return m.group(1)
-    # fallback query param
+async def is_user_subscribed(user_id):
+    """Checks if a user is a member of the force subscribe channel."""
     try:
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(text)
-        qs = parse_qs(parsed.query)
-        if 'v' in qs:
-            return qs['v'][0]
+        await app.get_chat_member(chat_id=FORCE_CHANNEL, user_id=user_id)
+        return True
     except Exception:
-        pass
-    return None
-
-def thumb_urls(video_id: str):
-    return {
-        'maxres': f'https://img.youtube.com/vi/{video_id}/maxresdefault.jpg',
-        'hq': f'https://img.youtube.com/vi/{video_id}/hqdefault.jpg',
-        'sd': f'https://img.youtube.com/vi/{video_id}/sddefault.jpg',
-        'mq': f'https://img.youtube.com/vi/{video_id}/mqdefault.jpg',
-        'default': f'https://img.youtube.com/vi/{video_id}/default.jpg',
-    }
-
-async def is_subscribed(client: Client, user_id: int) -> bool:
-    if not FORCE_CHANNEL:
-        return True
-    try:
-        member = await client.get_chat_member(FORCE_CHANNEL, user_id)
-        return member.status not in ('left','kicked')
-    except UserNotParticipant:
         return False
-    except Exception as e:
-        logger.warning("Failed to check subscription: %s - allowing by default.", e)
-        return True
 
-async def send_log_new_user(client: Client, user) -> None:
+async def add_user_to_db(message: Message):
+    """Adds or updates user information in the database."""
+    if not mongo_client:
+        return
+    user_id = message.from_user.id
+    if not user_collection.find_one({"user_id": user_id}):
+        user_data = {
+            "user_id": user_id,
+            "username": message.from_user.username or "N/A",
+            "first_name": message.from_user.first_name,
+            "join_date": datetime.utcnow(),
+            "usage_count": 0,
+        }
+        user_collection.insert_one(user_data)
+        # Log new user to the log channel
+        await app.send_message(
+            LOG_CHANNEL,
+            f"**✨ New User Alert ✨**\n\n"
+            f"**User Name:** {message.from_user.first_name}\n"
+            f"**User ID:** `{user_id}`\n"
+            f"**Username:** @{message.from_user.username}\n"
+            f"**Bot Name:** {BOT_NAME}"
+        )
+
+# --- Command Handlers ---
+
+@app.on_message(filters.command("start"))
+async def start_command(client, message: Message):
+    """Handles the /start command."""
+    await add_user_to_db(message)
+
+    welcome_text = (
+        f"**👋 Hello, {message.from_user.first_name}!**\n\n"
+        f"I am the **{BOT_NAME}**, your reliable assistant for downloading YouTube video thumbnails.\n\n"
+        "Simply send me any YouTube video link to get started!"
+    )
+    
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💡 About Bot", callback_data="about_bot"), InlineKeyboardButton("📢 Updates Channel", url="https://t.me/BotClusters")],
+            [InlineKeyboardButton("🛠️ More Tools", callback_data="more_tools"), InlineKeyboardButton("🤝 Support", url="https://t.me/BC_Support")],
+        ]
+    )
+    
+    await message.reply_photo(
+        photo=START_IMAGE,
+        caption=welcome_text,
+        reply_markup=keyboard
+    )
+
+@app.on_message(filters.text & ~filters.command("start"))
+async def handle_youtube_url(client, message: Message):
+    """Handles YouTube URL messages."""
+    user_id = message.from_user.id
+    
+    # --- Force Subscribe Check ---
+    if not await is_user_subscribed(user_id):
+        join_link = (await app.get_chat(FORCE_CHANNEL)).invite_link
+        if not join_link:
+            # Fallback in case invite link isn't fetchable
+            join_link = f"https://t.me/{FORCE_CHANNEL}"
+
+        await message.reply_text(
+            "**⚠️ Access Denied!**\n\n"
+            "To use this bot, you must join our updates channel. This helps us keep you updated on new features and important announcements.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("➡️ Join Channel", url=join_link)],
+                    [InlineKeyboardButton("✅ I Have Joined", callback_data="check_subscribe")]
+                ]
+            )
+        )
+        return
+
+    # --- URL Validation and Thumbnail Generation ---
+    video_id = get_video_id(message.text)
+    
+    if not video_id:
+        await message.reply_text("❌ **Invalid URL!** Please send a valid YouTube video link.")
+        return
+
+    sd_thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+    hd_thumbnail_url = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+
+    caption = f"🖼️ Thumbnails for **{video_id}**"
+    
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📥 Download SD", url=sd_thumbnail_url),
+                InlineKeyboardButton("📥 Download HD", url=hd_thumbnail_url)
+            ]
+        ]
+    )
+
     try:
-        text = ("🆕 New User Started the Bot\n\n"
-                f"👤 Name: [{user.first_name}](tg://user?id={user.id})\n"
-                f"🆔 User ID: `{user.id}`\n"
-                f"⏰ Joined: {now_str()}\n"
-                f"🤖 From: {BOT_NAME}")
-        if LOG_CHANNEL:
-            await client.send_message(LOG_CHANNEL, text, parse_mode='markdown')
-    except Exception as e:
-        logger.warning("Could not send log message: %s", e)
+        # Send HD first, as it's the most requested
+        await message.reply_photo(photo=hd_thumbnail_url, caption=caption, reply_markup=keyboard)
+    except Exception:
+        try:
+            # Fallback to SD if HD isn't available
+            await message.reply_photo(photo=sd_thumbnail_url, caption=caption, reply_markup=keyboard)
+        except Exception as e:
+            await message.reply_text("Could not fetch the thumbnail. Please check the video link.")
+            logging.error(f"Error fetching thumbnail for {video_id}: {e}")
+
+    # Update usage count
+    if mongo_client:
+        user_collection.update_one({"user_id": user_id}, {"$inc": {"usage_count": 1}})
 
 
-def start_keyboard():
-    buttons = [
-        [InlineKeyboardButton('🧾 About Bot', callback_data='about_bot'), InlineKeyboardButton('🆕 Updates', url=f'https://t.me/{FORCE_CHANNEL.replace('@','')}' if FORCE_CHANNEL else 'https://t.me/')],
-        [InlineKeyboardButton('⚙️ More Tools', callback_data='more_tools'), InlineKeyboardButton('💬 Support', url='https://t.me/your_support_group')]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-def force_keyboard():
-    buttons = [
-        [InlineKeyboardButton('🔔 Join Channel', url=f'https://t.me/{FORCE_CHANNEL.replace('@','')}')],
-        [InlineKeyboardButton('✅ I Joined', callback_data='check_sub')]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-def thumbnail_keyboard(video_url: str, video_id: str):
-    urls = thumb_urls(video_id)
-    buttons = [
-        [InlineKeyboardButton('🖼 HD (maxres)', url=urls['maxres'])],
-        [InlineKeyboardButton('📷 SD (hq)', url=urls['hq'])],
-        [InlineKeyboardButton('🔗 Open Video', url=video_url)]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-# Handlers
-@app.on_message(filters.private & filters.command('start'))
-async def cmd_start(client, message):
-    user = message.from_user
-    # save user
-    if not users_col.find_one({'user_id': user.id}):
-        users_col.insert_one({
-            'user_id': user.id,
-            'username': user.username or '',
-            'first_name': user.first_name or '',
-            'join_date': datetime.utcnow(),
-            'usage_count': 0,
-            'is_banned': False
-        })
-        await send_log_new_user(client, user)
-    else:
-        users_col.update_one({'user_id': user.id}, {'$set': {'last_active': datetime.utcnow()}})
-
-    caption = (f"👋 Hey [{user.first_name}](tg://user?id={user.id}),\n\n"
-               f"Welcome to *{BOT_NAME}* 🎉\n"
-               "I can fetch *HD / SD / 4K YouTube Thumbnails* instantly!\n\n"
-               "📸 Just send any YouTube video link below.\n")
-
-    try:
-        await client.send_photo(chat_id=message.chat.id, photo=START_IMAGE, caption=caption, parse_mode='markdown', reply_markup=start_keyboard())
-    except Exception as e:
-        logger.warning("Failed sending start image: %s", e)
-        await client.send_message(chat_id=message.chat.id, text=caption, parse_mode='markdown', reply_markup=start_keyboard())
+# --- Callback Query Handlers ---
 
 @app.on_callback_query()
-async def callbacks(client, callback_query):
+async def callback_query_handler(client, callback_query):
+    """Handles all callback queries."""
     data = callback_query.data
-    user = callback_query.from_user
+    
+    if data == "about_bot":
+        await callback_query.message.edit_caption(
+            caption="**About This Bot**\n\n"
+                    "This bot is designed to help you quickly download high-quality thumbnails from any YouTube video.\n\n"
+                    "**Features:**\n"
+                    "✅ HD & SD Quality\n"
+                    "✅ Fast & Reliable\n"
+                    "✅ Easy to Use\n\n"
+                    "Powered by [BotClusters](https://t.me/BotClusters).",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
+        )
+    
+    elif data == "more_tools":
+        await callback_query.message.edit_caption(
+            caption="**Discover More Tools**\n\n"
+                    "Explore our collection of other useful bots and tools designed to make your life easier!\n\n"
+                    "Visit our main channel to see what else we have to offer.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🤖 Explore Bots", url="https://t.me/BotClusters")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]
+            ])
+        )
+        
+    elif data == "back_to_start":
+        welcome_text = (
+            f"**👋 Hello, {callback_query.from_user.first_name}!**\n\n"
+            f"I am the **{BOT_NAME}**, your reliable assistant for downloading YouTube video thumbnails.\n\n"
+            "Simply send me any YouTube video link to get started!"
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("💡 About Bot", callback_data="about_bot"), InlineKeyboardButton("📢 Updates Channel", url="https://t.me/BotClusters")],
+                [InlineKeyboardButton("🛠️ More Tools", callback_data="more_tools"), InlineKeyboardButton("🤝 Support", url="https://t.me/BC_Support")],
+            ]
+        )
+        await callback_query.message.edit_caption(caption=welcome_text, reply_markup=keyboard)
 
-    if data == 'about_bot':
-        text = (f"🤖 *About {BOT_NAME}*\n\n"
-                "I fetch thumbnails from YouTube videos.\n"
-                "Built with Pyrogram & MongoDB. Hosted on Koyeb.\n")
-        await callback_query.answer()
-        await client.send_message(user.id, text, parse_mode='markdown')
-
-    elif data == 'more_tools':
-        text = "🧩 *More Tools (Coming Soon)*\n\n- YouTube Shorts Saver\n- Channel Logo Downloader\n- Premium Features\n"
-        await callback_query.answer()
-        await client.send_message(user.id, text, parse_mode='markdown')
-
-    elif data == 'check_sub':
-        await callback_query.answer('Checking subscription...', show_alert=False)
-        ok = await is_subscribed(client, user.id)
-        if ok:
-            users_col.update_one({'user_id': user.id}, {'$set': {'force_subscribed': True}}, upsert=True)
-            await client.send_message(user.id, '✅ Thanks for joining. Now send me a YouTube link.')
+    elif data == "check_subscribe":
+        if await is_user_subscribed(callback_query.from_user.id):
+            await callback_query.answer("Thank you for joining! You can now use the bot.", show_alert=True)
+            await callback_query.message.delete()
         else:
-            await client.send_message(user.id, '❌ You are not a member yet. Please join the channel and try again.')
+            await callback_query.answer("You have not joined the channel yet. Please join to continue.", show_alert=True)
+            
+    await callback_query.answer()
 
-@app.on_message(filters.private & filters.regex(r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/'))
-async def handle_youtube(client, message):
-    user = message.from_user
-    text = message.text.strip()
 
-    # ban check
-    u = users_col.find_one({'user_id': user.id})
-    if u and u.get('is_banned'):
-        return await message.reply_text('You are banned from using this bot.')
+# --- Main Execution ---
 
-    # force sub
-    if not await is_subscribed(client, user.id):
-        return await message.reply_text('⚠️ To use this bot, please join our update channel first!', reply_markup=force_keyboard())
-
-    vid = extract_video_id(text)
-    if not vid:
-        return await message.reply_text('❌ Invalid YouTube link!')
-
-    urls = thumb_urls(vid)
-    users_col.update_one({'user_id': user.id}, {'$inc': {'usage_count': 1}, '$set': {'last_active': datetime.utcnow()}}, upsert=True)
-    logs_col.insert_one({'user_id': user.id, 'video_id': vid, 'time': datetime.utcnow(), 'bot_name': BOT_NAME})
-
-    # send thumbnail (try maxres then fallback)
-    try:
-        await client.send_photo(chat_id=message.chat.id, photo=urls['maxres'], caption=f'Thumbnail for https://youtu.be/{vid}', reply_markup=thumbnail_keyboard(text, vid))
-    except Exception:
-        await client.send_photo(chat_id=message.chat.id, photo=urls['hq'], caption=f'Thumbnail for https://youtu.be/{vid}', reply_markup=thumbnail_keyboard(text, vid))
-
-# Admin command: /stats
-@app.on_message(filters.private & filters.command('stats') & filters.user(*ADMINS) if ADMINS else filters.private & filters.command('stats'))
-async def cmd_stats(client, message):
-    total_users = users_col.count_documents({})
-    total_logs = logs_col.count_documents({})
-    await message.reply_text(f'📊 Total Users: {total_users}\n📝 Total Actions Logged: {total_logs}')
-
-if __name__ == '__main__':
-    logger.info('Starting bot...')
+if __name__ == "__main__":
+    logging.info(f"{BOT_NAME} - Bot starting...")
     app.run()
+    print("Bot started successfully on Koyeb 🚀")
